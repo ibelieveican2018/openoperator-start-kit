@@ -1,62 +1,87 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <torch_mlu/csrc/framework/core/caching_allocator.h>
+#include <torch_mlu/csrc/framework/core/mlu_guard.h>
+#include <torch_mlu/csrc/framework/core/stream.h>
 
 #define CHUNK_SIZE 4096
 
-__mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, float negative_slope) {
-    // 多核拆分参数
-    uint32_t core_id = taskId;
+__mlu_entry__ void leakyrelu_kernel(float* input,
+                                    float* output,
+                                    int total,
+                                    float negative_slope) {
+    uint32_t core_id  = taskId;
     uint32_t core_num = taskDim;
-    uint32_t per_core = total / core_num;
+
+    uint32_t per_core  = total / core_num;
     uint32_t remainder = total % core_num;
+
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
-    // NRAM 空间分配
+    if (count == 0) return;
+
     __nram__ float nram_input[CHUNK_SIZE];
     __nram__ float nram_relu[CHUNK_SIZE];
     __nram__ float nram_temp[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
-        // Bang C 向量指令要求长度对齐到 64 个 float (256 字节)
-        uint32_t aligned_len = (len + 63) & ~63;
+        uint32_t len = ((offset + CHUNK_SIZE) <= count) ? CHUNK_SIZE : (count - offset);
+        uint32_t aligned_len = (len + 63) & ~63;   // 64-float 对齐
 
-        // 从 GDRAM 加载数据到 NRAM
-        __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
+        // 先清零，避免 aligned_len > len 时尾部是脏数据
+        __bang_write_zero(nram_input, aligned_len);
+        __bang_write_zero(nram_relu, aligned_len);
+        __bang_write_zero(nram_temp, aligned_len);
 
-        // 1. 计算 relu(x) = max(0, x)
+        // 只拷贝有效数据
+        __memcpy(nram_input,
+                 input + start + offset,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
+
+        // relu(x) = max(x, 0)
         __bang_active_relu(nram_relu, nram_input, aligned_len);
 
-        // 2. 计算 min(0, x) = x - relu(x)
+        // temp = x - relu(x) = min(x, 0)
         __bang_sub(nram_temp, nram_input, nram_relu, aligned_len);
 
-        // 3. 计算 negative_slope * min(0, x)
+        // temp = negative_slope * min(x, 0)
         __bang_mul_scalar(nram_temp, nram_temp, negative_slope, aligned_len);
 
-        // 4. 计算 leaky_relu(x) = relu(x) + negative_slope * min(0, x)
+        // temp = relu(x) + negative_slope * min(x, 0)
         __bang_add(nram_temp, nram_relu, nram_temp, aligned_len);
 
-        // 写回 GDRAM（只写有效长度）
-        __memcpy(output + start + offset, nram_temp, len * sizeof(float), NRAM2GDRAM);
+        // 只写回有效长度
+        __memcpy(output + start + offset,
+                 nram_temp,
+                 len * sizeof(float),
+                 NRAM2GDRAM);
     }
 }
 
-torch::Tensor leakyrelu_bang(torch::Tensor input, float negative_slope) {
-    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+torch::Tensor bang_func(torch::Tensor input, float negative_slope) {
+    TORCH_CHECK(input.is_mlu(), "input must be an MLU tensor");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "only float32 is supported");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
 
     auto output = torch::empty_like(input);
     int total = input.numel();
 
-    // 获取 MLU 队列
+    if (total == 0) {
+        return output;
+    }
+
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 配置任务维度（使用 4 个 core）
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim;
+    dim.x = 4;
+    dim.y = 1;
+    dim.z = 1;
+
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // 启动 kernel
     leakyrelu_kernel<<<dim, ktype, queue>>>(
         input.data_ptr<float>(),
         output.data_ptr<float>(),
@@ -65,4 +90,8 @@ torch::Tensor leakyrelu_bang(torch::Tensor input, float negative_slope) {
     );
 
     return output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "LeakyReLU bang op on MLU");
 }
